@@ -28,6 +28,7 @@ export class ProductsController {
     @Param('id', ParseUUIDPipe) id: string, 
     @Body() updateProductDto: UpdateProductDto
   ) {
+    console.log(updateProductDto.slug)
     return this.productsService.update(id, updateProductDto);
   }
 
