@@ -1,11 +1,12 @@
-import { BadRequestException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, InternalServerErrorException, Logger, NotFoundException, Delete } from '@nestjs/common';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { Product, ProductImage} from './entities';
 import { PaginationDto } from 'src/common/dtos/pagination.dto';
 import {validate as isUUID} from 'uuid'
+import { User } from 'src/auth/entities/user.entity';
 
 @Injectable()
 export class ProductsService {
@@ -16,23 +17,28 @@ export class ProductsService {
     @InjectRepository(Product)
     private readonly productRepository: Repository<Product>,
     @InjectRepository(ProductImage)
-    private readonly productImageRepository: Repository<ProductImage>
+    private readonly productImageRepository: Repository<ProductImage>,
+    private readonly dataSource: DataSource,
   ){
   }
 
-  async create(createProductDto: CreateProductDto) {
+  async create(createProductDto: CreateProductDto, user: User) {
     try {
-      const {images = [], ...productDetails } = createProductDto
       
-      const product = this.productRepository.create({
+      const {images = [], ...productDetails } = createProductDto
+
+      
+
+      const product = await this.productRepository.create({
         ...productDetails,
-        images: images.map( image => this.productImageRepository.create({url: image}))
+        images: images.map(image => this.productImageRepository.create({url: image})),
+        user
       })
+
       await this.productRepository.save(product)
 
-      console.log({...product})
-
       return {...product, images}
+
     } catch (error) {
       this.handleExceptions(error)
     }
@@ -40,10 +46,18 @@ export class ProductsService {
 
   async findAll(paginationDto: PaginationDto) {
     const {limit = 10, offset = 0} = paginationDto
-    return await this.productRepository.find({
+    const products = await this.productRepository.find({
       take: limit,
-      skip: offset
+      skip: offset,
+      relations: {
+        images: true
+      }
     })
+
+    return products.map( product => ({
+      ...product,
+      images: product.images.map(img => img.url)
+    }))
   }
 
   async findOne(term: string) {
@@ -52,12 +66,14 @@ export class ProductsService {
     if(isUUID(term)){
       product = await this.productRepository.findOneBy({id: term})
     } else {
-      const queryBuilder = this.productRepository.createQueryBuilder()
+      const queryBuilder = this.productRepository.createQueryBuilder('prod')
       product = await queryBuilder
       .where(`UPPER(title) =:title or slug =:slug`, {
         title: term.toUpperCase(),
         slug: term.toLowerCase(),
-      }).getOne()
+      })
+      .leftJoinAndSelect('prod.images', 'prodImages')
+      .getOne()
       
       product = await this.productRepository.findOneBy({slug: term})
     }
@@ -65,26 +81,51 @@ export class ProductsService {
     return product
   }
 
-  async update(id: string, updateProductDto: UpdateProductDto) {
+  async findOnePlain(term:string){
+    const {images= [], ...product} = await this.findOne(term)
+    return {
+      ...product,
+      images: images.map(image => image.url)
+    }
+  }
+
+
+  async update(id: string, updateProductDto: UpdateProductDto, user: User) {
   
-    const product = await this.productRepository.preload({
-      id: id,
-      ...updateProductDto,
-      images: []
-    })
+    const {images, ...toUpdate } = updateProductDto
+
+    const product = await this.productRepository.preload({ id, ...toUpdate})
 
     if(!product) throw new NotFoundException(`Product with id: ${id} not found`)
 
+    const queryRunner = this.dataSource.createQueryRunner()
+    await queryRunner.connect()
+    await queryRunner.startTransaction()
     try {
-      await this.productRepository.save(product)
-      return product
+
+      if(images){
+        await queryRunner.manager.delete(ProductImage, {product: {id}})
+        
+        product.images = images.map(
+          image => this.productImageRepository.create({url: image})
+        )
+      }
+
+      product.user = user
+      await queryRunner.manager.save(product)
+
+      return this.findOnePlain(id)
+
     } catch (error) {
+        await queryRunner.rollbackTransaction()
+        await queryRunner.release()
         this.handleExceptions(error)
     }
   }
 
   async remove(id: string) {
-    return await this.productRepository.delete({id})
+    const product = await this.findOne(id)
+    await this.productRepository.remove(product)
   }
 
   private handleExceptions(error: any){
@@ -93,5 +134,19 @@ export class ProductsService {
     }
     this.logger.error(error)
     throw new InternalServerErrorException('Unexpected error, chceck server logs')
+  }
+
+  async deleteAllProducts(){
+    const query = this.productRepository.createQueryBuilder('product')
+
+    try {
+      return await query
+      .delete()
+      .where({})
+      .execute()
+
+    } catch (error) {
+      
+    }
   }
 }
